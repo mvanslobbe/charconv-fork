@@ -78,6 +78,57 @@ BOOST_CHARCONV_CONSTEXPR char* decompose32(std::uint32_t value, char* buffer) no
     return buffer + 10;
 }
 
+// ceil(2^57 / 10^k)
+static constexpr std::uint64_t fixed_point_scale[] = {
+        UINT64_C(144115188075855872), UINT64_C(14411518807585588), UINT64_C(1441151880758559),
+        UINT64_C(144115188075856), UINT64_C(14411518807586), UINT64_C(1441151880759),
+        UINT64_C(144115188076), UINT64_C(14411518808), UINT64_C(1441151881)
+};
+
+// Not memcpy: with _FORTIFY_SOURCE, GCC turns a memcpy at a variable
+// offset into a call to __memcpy_chk instead of one 16-bit store
+BOOST_CHARCONV_CONSTEXPR void print_pair(std::size_t pair, char* out) noexcept
+{
+    #if defined(__GNUC__) && !(defined(BOOST_CHARCONV_ENABLE_CUDA) && defined(__CUDACC__))
+    if (!BOOST_CHARCONV_IS_CONSTANT_EVALUATED(pair))
+    {
+        __builtin_memcpy(out, radix_table + pair * 2, 2);
+        return;
+    }
+    #endif
+    out[0] = radix_table[pair * 2];
+    out[1] = radix_table[pair * 2 + 1];
+}
+
+// Writes the n digits of value (value < 10^n, 1 <= n <= 10) as decompose32
+// does, but starting at the first digit instead of always writing ten
+BOOST_CHARCONV_CONSTEXPR char* print_digits32(std::uint32_t value, int n, char* out) noexcept
+{
+    constexpr auto mask = (std::uint64_t(1) << 57) - 1;
+    const int leading = 2 - (n & 1);
+    auto y = value * fixed_point_scale[n - leading];
+
+    if (leading == 1)
+    {
+        *out = static_cast<char>('0' + static_cast<int>(y >> 57));
+    }
+    else
+    {
+        print_pair(static_cast<std::size_t>(y >> 57), out);
+    }
+    out += leading;
+
+    for (n -= leading; n > 0; n -= 2)
+    {
+        y &= mask;
+        y *= 100;
+        print_pair(static_cast<std::size_t>(y >> 57), out);
+        out += 2;
+    }
+
+    return out;
+}
+
 #ifdef BOOST_MSVC
 # pragma warning(push)
 # pragma warning(disable: 4127 4146)
@@ -89,7 +140,6 @@ BOOST_CHARCONV_CONSTEXPR to_chars_result to_chars_integer_impl(char* first, char
     using Unsigned_Integer = typename std::make_unsigned<Integer>::type;
     Unsigned_Integer unsigned_value {};
 
-    char buffer[10] {};
     int converted_value_digits {};
     bool is_negative = false;
 
@@ -136,15 +186,12 @@ BOOST_CHARCONV_CONSTEXPR to_chars_result to_chars_integer_impl(char* first, char
             return {last, std::errc::value_too_large};
         }
 
-        decompose32(converted_value, buffer);
-
         if (is_negative)
         {
             *first++ = '-';
         }
 
-        boost::charconv::detail::memcpy(first, buffer + (sizeof(buffer) - static_cast<unsigned>(converted_value_digits)),
-                                        static_cast<std::size_t>(converted_value_digits));
+        print_digits32(converted_value, converted_value_digits, first);
     }
     else if (std::numeric_limits<Integer>::digits <= std::numeric_limits<std::uint64_t>::digits ||
              static_cast<std::uint64_t>(unsigned_value) <= (std::numeric_limits<std::uint64_t>::max)())
@@ -162,50 +209,19 @@ BOOST_CHARCONV_CONSTEXPR to_chars_result to_chars_integer_impl(char* first, char
             *first++ = '-';
         }
 
-        // Only store 9 digits in each to avoid overflow
-        if (num_digits(converted_value) <= 18)
+        // Print blocks of 9 digits, each below 10^9
+        char* out = first;
+        if (converted_value_digits > 18)
         {
-            const auto x = static_cast<std::uint32_t>(converted_value / UINT64_C(1000000000));
-            const auto y = static_cast<std::uint32_t>(converted_value % UINT64_C(1000000000));
-            const int first_value_chars = num_digits(x);
-
-            decompose32(x, buffer);
-            boost::charconv::detail::memcpy(first, buffer + (sizeof(buffer) - static_cast<unsigned>(first_value_chars)),
-                                            static_cast<std::size_t>(first_value_chars));
-
-            decompose32(y, buffer);
-            boost::charconv::detail::memcpy(first + first_value_chars, buffer + 1, sizeof(buffer) - 1);
+            out = print_digits32(static_cast<std::uint32_t>(converted_value / UINT64_C(1000000000000000000)), converted_value_digits - 18, out);
+            converted_value %= UINT64_C(1000000000000000000);
+            out = print_digits32(static_cast<std::uint32_t>(converted_value / UINT64_C(1000000000)), 9, out);
         }
         else
         {
-            const auto x = static_cast<std::uint32_t>(converted_value / UINT64_C(100000000000));
-            converted_value -= x * UINT64_C(100000000000);
-            const auto y = static_cast<std::uint32_t>(converted_value / UINT64_C(100));
-            const auto z = static_cast<std::uint32_t>(converted_value % UINT64_C(100));
-
-            if (converted_value_digits == 19)
-            {
-                decompose32(x, buffer);
-                boost::charconv::detail::memcpy(first, buffer + 2, sizeof(buffer) - 2);
-
-                decompose32(y, buffer);
-                boost::charconv::detail::memcpy(first + 8, buffer + 1, sizeof(buffer) - 1);
-
-                // Always prints 2 digits last
-                boost::charconv::detail::memcpy(first + 17, radix_table + z * 2, 2);
-            }
-            else // 20
-            {
-                decompose32(x, buffer);
-                boost::charconv::detail::memcpy(first, buffer + 1, sizeof(buffer) - 1);
-
-                decompose32(y, buffer);
-                boost::charconv::detail::memcpy(first + 9, buffer + 1, sizeof(buffer) - 1);
-
-                // Always prints 2 digits last
-                boost::charconv::detail::memcpy(first + 18, radix_table + z * 2, 2);
-            }
+            out = print_digits32(static_cast<std::uint32_t>(converted_value / UINT64_C(1000000000)), converted_value_digits - 9, out);
         }
+        print_digits32(static_cast<std::uint32_t>(converted_value % UINT64_C(1000000000)), 9, out);
     }
 
     return {first + converted_value_digits, std::errc()};
